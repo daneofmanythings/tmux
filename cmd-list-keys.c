@@ -27,17 +27,20 @@
  * List key bindings.
  */
 
-#define LIST_KEYS_TEMPLATE			\
-	"bind-key"				\
-	"#{p3:?key_binding_repeat, -r,} "	\
-	"-T #{p%u:key_binding_tablename}"	\
-	"#{p%u:key_binding_key}"		\
-	"#{key_binding_command}"		\
+#define REPEAT_FMT		\
+	"#{?key_repeat,-r,  } "
 
-#define LIST_KEYS_N_FLAG_TEMPLATE	\
-	"#{key_binding_prefix}"		\
-	"#{p%u:key_binding_key} "	\
-	"#{key_binding_note}"
+#define LIST_KEYS_TEMPLATE		\
+	"bind-key "			\
+	"%s"				\
+        "-T #{p%u:key_tablename} "      \
+	"#{p%u:key_string} "		\
+	"#{key_command}"		\
+
+#define LIST_KEYS_N_FLAG_TEMPLATE			\
+	"#{key_prefix} "				\
+	"#{p%u:key_string} "				\
+	"#{?key_note,#{key_note},#{key_command}}"
 
 static enum cmd_retval cmd_list_keys_exec(struct cmd *, struct cmdq_item *);
 
@@ -54,14 +57,15 @@ const struct cmd_entry cmd_list_keys_entry = {
 };
 
 static char *
-cmd_list_keys_get_prefix(struct args *args, key_code *prefix)
+cmd_list_keys_get_prefix(struct args *args)
 {
-	char	*s;
+	char		*s;
+	key_code	 prefix;
 
-	*prefix = options_get_number(global_s_options, "prefix");
+	prefix = options_get_number(global_s_options, "prefix");
 	if (!args_has(args, 'P')) {
-		if (*prefix != KEYC_NONE)
-			xasprintf(&s, "%s ", key_string_lookup_key(*prefix, 0));
+		if (prefix != KEYC_NONE)
+			xasprintf(&s, "%s", key_string_lookup_key(prefix, 0));
 		else
 			s = xstrdup("");
 	} else
@@ -69,47 +73,67 @@ cmd_list_keys_get_prefix(struct args *args, key_code *prefix)
 	return (s);
 }
 
+static int
+cmd_list_contains_repeatable_key_binding(struct key_binding **l, u_int n)
+{
+	u_int	i;
+
+	for (i = 0; i < n; i++)
+		if (l[i]->flags & KEY_BINDING_REPEAT)
+			return (1);
+	return (0);
+}
+
+static int
+cmd_skip_for_N_flag(struct key_binding *bd, struct args *args,
+    const char *tablename)
+{
+	if (!args_has(args, 'N'))
+		return (0);
+	if (strcasecmp(bd->tablename, "root") != 0 &&
+	    strcasecmp(bd->tablename, "prefix") != 0 &&
+	    (args_has(args, 'T') && strcasecmp(bd->tablename, tablename) != 0))
+		return (1);
+	return (bd->note == NULL || args_has(args, 'a'));
+}
+
 static u_int
-cmd_list_keys_get_width(struct key_binding **l, u_int n, key_code only)
+cmd_list_keys_get_width(struct key_binding **l, u_int n, struct args *args,
+    const char *tablename)
 {
 	struct key_binding	*bd;
 	u_int			 i, width, keywidth = 0;
 
 	for (i = 0; i < n; i++) {
 		bd = l[i];
-		if ((only != KEYC_UNKNOWN && bd->key != only))
+		if (cmd_skip_for_N_flag(bd, args, tablename))
 			continue;
 
 		width = utf8_cstrwidth(key_string_lookup_key(bd->key, 0));
 		if (width > keywidth)
 			keywidth = width;
 	}
-
-	return (keywidth + 1);
+	return (keywidth);
 }
 
 static u_int
-cmd_list_keys_get_table_width(struct key_binding **l, u_int n, key_code only)
+cmd_list_keys_get_table_width(struct key_binding **l, u_int n)
 {
 	struct key_binding	*bd;
 	u_int			 i, width, tablewidth = 0;
 
 	for (i = 0; i < n; i++) {
 		bd = l[i];
-		if ((only != KEYC_UNKNOWN && bd->key != only))
-			continue;
-
 		width = utf8_cstrwidth(bd->tablename);
 		if (width > tablewidth)
 			tablewidth = width;
 	}
-
-	return (tablewidth + 1);
+	return (tablewidth);
 }
 
-static char *
-cmd_list_single_key_binding(const struct key_binding *bd, const char *prefix, 
-    struct format_tree *ft, const char *template, struct cmdq_item *item)
+static void
+cmd_format_tree_add_key_binding(struct format_tree *ft,
+    const struct key_binding *bd, const char *prefix)
 {
 	char	*tmp;
 
@@ -117,29 +141,16 @@ cmd_list_single_key_binding(const struct key_binding *bd, const char *prefix,
 		tmp = xstrdup("1");
 	else
 		tmp = xstrdup("0");
-	format_add(ft, "key_binding_repeat", "%s", tmp);
-
-	tmp = xstrdup(prefix);
-	format_add(ft, "key_binding_prefix", "%s", tmp);
-
-	tmp = xstrdup(bd->tablename);
-	format_add(ft, "key_binding_tablename", "%s", tmp);
-
-	tmp = args_escape(key_string_lookup_key(bd->key, 0));
-	format_add(ft, "key_binding_key", "%s", tmp);
-
-	tmp = cmd_list_print(bd->cmdlist,
-	    CMD_LIST_PRINT_ESCAPED|CMD_LIST_PRINT_NO_GROUPS);
-	format_add(ft, "key_binding_command", "%s", tmp);
-
+	format_add(ft, "key_repeat", "%s", tmp);
 	if (bd->note != NULL)
-		tmp = xstrdup(bd->note);
-	else
-		tmp = xstrdup("");
-	format_add(ft, "key_binding_note", "%s", tmp);
-
-
-	return format_expand(ft, template);
+		format_add(ft, "key_note", "%s", xstrdup(bd->note));
+	format_add(ft, "key_prefix", "%s", xstrdup(prefix));
+	format_add(ft, "key_tablename", "%s", xstrdup(bd->tablename));
+	format_add(ft, "key_string", "%s",
+	    key_string_lookup_key(bd->key, 0));
+	format_add(ft, "key_command", "%s",
+	    cmd_list_print(bd->cmdlist,
+	        CMD_LIST_PRINT_ESCAPED|CMD_LIST_PRINT_NO_GROUPS));
 }
 
 static enum cmd_retval
@@ -150,12 +161,12 @@ cmd_list_keys_exec(struct cmd *self, struct cmdq_item *item)
 	struct format_tree	*ft;
 	struct key_table	*table;
 	struct key_binding	*bd, **l;
-	const char		*tablename, *keystr, *line;
-	char			*template;
-	int			 free_template = 0;
-	char			*prefixstr = NULL;
-	key_code		 prefix, only = KEYC_UNKNOWN;
+	key_code		 only = KEYC_UNKNOWN;
+	const char		*template, *tablename, *keystr, *line, *repeat;
+	static char		 template0[8192];
+	char			*prefix = NULL;
 	u_int			 i, n, keywidth, tablewidth = 0;
+	int			 single;
 	struct sort_criteria	 sort_crit;
 
 	if ((keystr = args_string(args, 0)) != NULL) {
@@ -176,39 +187,40 @@ cmd_list_keys_exec(struct cmd *self, struct cmdq_item *item)
 			cmdq_error(item, "table %s doesn't exist", tablename);
 			return (CMD_RETURN_ERROR);
 		}
-		l = sort_get_key_bindings_table(table, &n, &sort_crit);
+		l = sort_get_key_bindings_table(table, only, &n, &sort_crit);
 	} else
-		l = sort_get_key_bindings(&n, &sort_crit);
+		l = sort_get_key_bindings(only, &n, &sort_crit);
 
+	if (cmd_list_contains_repeatable_key_binding(l, n))
+		repeat = REPEAT_FMT;
+	else
+		repeat = "";
 	if ((template = args_get(args, 'F')) == NULL) {
-		free_template = 1;
-		keywidth = cmd_list_keys_get_width(l, n, only);
-		tablewidth = cmd_list_keys_get_table_width(l, n, only);
-		if (args_has(args, 'N'))
-			xasprintf(&template, LIST_KEYS_N_FLAG_TEMPLATE,
-			    keywidth);
-		else
-			xasprintf(&template, LIST_KEYS_TEMPLATE, tablewidth,
-			    keywidth);
+		keywidth = cmd_list_keys_get_width(l, n, args, tablename);
+		if (args_has(args, 'N')) {
+			xsnprintf(template0, sizeof template0,
+			    LIST_KEYS_N_FLAG_TEMPLATE, keywidth);
+		} else {
+			tablewidth = cmd_list_keys_get_table_width(l, n);
+			xsnprintf(template0, sizeof template0,
+			    LIST_KEYS_TEMPLATE, repeat, tablewidth, keywidth);
+		}
+		template = template0;
 	}
 
-	prefixstr = cmd_list_keys_get_prefix(args, &prefix);
-
+	prefix = cmd_list_keys_get_prefix(args);
+	single = args_has(args, '1');
 	ft = format_create(cmdq_get_client(item), item, FORMAT_NONE, 0);
 	format_defaults(ft, NULL, NULL, NULL, NULL);
-
 	for (i = 0; i < n; i++) {
 		bd = l[i];
-		if (only != KEYC_UNKNOWN && bd->key != only)
+		if (cmd_skip_for_N_flag(bd, args, tablename))
 			continue;
 
-		if (args_has(args, 'N') && !args_has(args, 'a')
-		    && bd->note == NULL && only == KEYC_UNKNOWN)
-			continue;
+		cmd_format_tree_add_key_binding(ft, bd, prefix);
+		line = format_expand(ft, template);
 
-		line = cmd_list_single_key_binding(bd, prefixstr, ft, template, item);
-
-		if (args_has(args, '1') && tc != NULL)
+		if ((single && tc != NULL) || n == 1)
 			status_message_set(tc, -1, 1, 0, 0, "%s", line);
 		else {
 			if (*line != '\0')
@@ -216,13 +228,11 @@ cmd_list_keys_exec(struct cmd *self, struct cmdq_item *item)
 		}
 		free(line);
 
-		if (args_has(args, '1'))
+		if (single)
 			break;
 	}
 	format_free(ft);
-	free(prefixstr);
-	if (free_template)
-		free(template);
+	free(prefix);
 
 	return (CMD_RETURN_NORMAL);
 }
